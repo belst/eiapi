@@ -1,0 +1,19 @@
+[package]
+name = "eiapi"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+anyhow = "1.0.89"
+axum = { version = "0.7.5", features = ["multipart"] }
+derive_builder = "0.20.1"
+futures = "0.3.30"
+metrics = "0.23.0"
+metrics-exporter-prometheus = "0.15.3"
+rand = "0.8.5"
+serde = { version = "1.0.210", features = ["derive"] }
+tokio = { version = "1.40.0", features = ["full", "macros", "process"] }
+tokio-util = { version = "0.7.12", features = ["io"] }
+tower-http = { version = "0.5.2", features = ["limit", "trace"] }
+tracing = "0.1.40"
+tracing-subscriber = { version = "0.3.18", features = ["env-filter"] }
