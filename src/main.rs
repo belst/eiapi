@@ -20,27 +20,53 @@ use axum::{
     routing::{get, post},
     BoxError, Json, Router,
 };
+use base64::prelude::*;
 use derive_builder::Builder;
 use futures::{stream, Stream, TryStreamExt};
 use serde::Serialize;
 use tokio::{fs::File, io::BufWriter, sync::Mutex};
 use tokio_util::io::StreamReader;
 use tower_http::limit::RequestBodyLimitLayer;
+use tracing_loki::{BackgroundTask, Layer};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 mod eirunner;
 
+fn setup_grafana_subscriber() -> (Layer, BackgroundTask) {
+    let user = env("GRAFANA_USER", "invalid".to_owned());
+    let api_key = env("GRAFANA_API_KEY", "invalid".to_owned());
+    let basic_auth = format!("{}:{}", user, api_key);
+
+    let encoded = BASE64_STANDARD.encode(basic_auth);
+
+    let url = url::Url::parse("https://grafana.bel.st").expect("invalid url");
+
+    tracing_loki::builder()
+        .label("application", "ei-runner")
+        .unwrap()
+        .extra_field("pid", format!("{}", std::process::id()))
+        .unwrap()
+        .http_header("Authorization", encoded)
+        .unwrap()
+        .build_url(url)
+        .unwrap()
+}
+
 fn setup_tracing() {
+    let (layer, task) = setup_grafana_subscriber();
     tracing_subscriber::registry()
         .with(
             tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| {
                 format!("{}=debug,tower_http=debug", env!("CARGO_CRATE_NAME")).into()
             }),
         )
+        .with(layer)
         .with(tracing_subscriber::fmt::layer())
         .init();
+    tokio::spawn(task);
 }
 
+#[derive(Debug)]
 struct AppState {
     seen: Mutex<HashSet<(u64, u64, String)>>,
     tx: tokio::sync::mpsc::UnboundedSender<PathBuf>,
@@ -138,6 +164,7 @@ fn env<T: FromStr>(key: &str, default: T) -> T {
         .unwrap_or(default)
 }
 
+#[tracing::instrument(skip(state, multipart))]
 async fn upload_evtc(
     State(state): State<Arc<AppState>>,
     mut multipart: Multipart,
@@ -198,6 +225,13 @@ async fn upload_evtc(
         .await
         .insert((evtc.filesize, evtc.trigger_id, evtc.account.clone()))
     {
+        tracing::info!(
+            account = %evtc.account,
+            filesize = %evtc.filesize,
+            trigger_id = %evtc.trigger_id,
+            file = %evtc.file.bytes.len(),
+            "duplicate evtc"
+        );
         return Err((StatusCode::CONFLICT, "duplicate".to_string()));
     }
     // TODO; parse file
