@@ -33,21 +33,21 @@ use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 mod eirunner;
 
 fn setup_grafana_subscriber() -> (Layer, BackgroundTask) {
-    let user = env("GRAFANA_USER", "invalid".to_owned());
-    let api_key = env("GRAFANA_API_KEY", "invalid".to_owned());
-    let basic_auth = format!("{}:{}", user, api_key);
+    // let user = env("GRAFANA_USER", "invalid".to_owned());
+    // let api_key = env("GRAFANA_API_KEY", "invalid".to_owned());
+    // let basic_auth = format!("{}:{}", user, api_key);
+    //
+    // let encoded = BASE64_STANDARD.encode(basic_auth);
 
-    let encoded = BASE64_STANDARD.encode(basic_auth);
-
-    let url = url::Url::parse("https://grafana.bel.st").expect("invalid url");
+    let url = url::Url::parse("http://localhost:3100").expect("invalid url");
 
     tracing_loki::builder()
         .label("application", "ei-runner")
         .unwrap()
         .extra_field("pid", format!("{}", std::process::id()))
         .unwrap()
-        .http_header("Authorization", encoded)
-        .unwrap()
+        // .http_header("Authorization", encoded)
+        // .unwrap()
         .build_url(url)
         .unwrap()
 }
