@@ -20,7 +20,6 @@ use axum::{
     routing::{get, post},
     BoxError, Json, Router,
 };
-use base64::prelude::*;
 use derive_builder::Builder;
 use futures::{stream, Stream, TryStreamExt};
 use serde::Serialize;
@@ -31,6 +30,7 @@ use tracing_loki::{BackgroundTask, Layer};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 mod eirunner;
+mod statrunner;
 
 fn setup_grafana_subscriber() -> (Layer, BackgroundTask) {
     // let user = env("GRAFANA_USER", "invalid".to_owned());
@@ -79,16 +79,11 @@ async fn main() {
     setup_tracing();
     std::fs::create_dir_all(UPLOADS_DIRECTORY).unwrap();
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
-    // tokio::spawn(async move {
-    //     let mut interval = tokio::time::interval(Duration::from_secs(120));
-    //
-    //     loop {
-    //         interval.tick().await;
-    //         tracing::info!("Queue size: {}", rx.len());
-    //     }
-    // });
+    tracing::info!("starting stat runner");
+    let (stat_tx, stat_rx) = tokio::sync::mpsc::unbounded_channel();
     tracing::info!("starting ei runner");
-    eirunner::run(rx);
+    eirunner::run(rx, stat_tx);
+    statrunner::run(stat_rx);
     let app = Router::new()
         .route("/", get(index))
         .route("/evtc", post(upload_evtc))
