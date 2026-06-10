@@ -30,7 +30,6 @@ use tracing_loki::{BackgroundTask, Layer};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 mod eirunner;
-mod statrunner;
 
 fn setup_grafana_subscriber() -> (Layer, BackgroundTask) {
     // let user = env("GRAFANA_USER", "invalid".to_owned());
@@ -79,11 +78,8 @@ async fn main() {
     setup_tracing();
     std::fs::create_dir_all(UPLOADS_DIRECTORY).unwrap();
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
-    tracing::info!("starting stat runner");
-    let (stat_tx, stat_rx) = tokio::sync::mpsc::unbounded_channel();
     tracing::info!("starting ei runner");
-    eirunner::run(rx, stat_tx);
-    statrunner::run(stat_rx);
+    eirunner::run(rx);
     let app = Router::new()
         .route("/", get(index))
         .route("/evtc", post(upload_evtc))

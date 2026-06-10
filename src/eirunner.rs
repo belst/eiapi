@@ -6,12 +6,9 @@ use std::{
 
 use anyhow::Context;
 use serde::Deserialize;
-use tokio::{
-    sync::mpsc::{UnboundedReceiver, UnboundedSender},
-    time::timeout,
-};
+use tokio::{sync::mpsc::UnboundedReceiver, time::timeout};
 
-use crate::{statrunner, QUEUE_SIZE};
+use crate::QUEUE_SIZE;
 
 const WINGMAN_SUCCSESS: &str = "Wingman: UploadProcessed successful: True";
 
@@ -116,7 +113,7 @@ pub fn check_output(output: &str) -> anyhow::Result<Option<String>> {
 //     Ok(ret)
 // }
 
-pub fn run(mut rx: UnboundedReceiver<PathBuf>, stat_tx: UnboundedSender<statrunner::Message>) {
+pub fn run(mut rx: UnboundedReceiver<PathBuf>) {
     let mut interval = tokio::time::interval(Duration::from_secs(120));
     tokio::spawn(async move {
         loop {
@@ -141,7 +138,6 @@ pub fn run(mut rx: UnboundedReceiver<PathBuf>, stat_tx: UnboundedSender<statrunn
                                     match check {
                                         Some(e) if e == WINGMAN_SUCCSESS => {
                                             tracing::info!("Successfully uploaded");
-                                            _ = stat_tx.send(statrunner::Message::Success);
                                         }
                                         None => {
                                             tracing::info!("Not Uploaded but issue is with the log not with wingman/parser");
@@ -156,10 +152,6 @@ pub fn run(mut rx: UnboundedReceiver<PathBuf>, stat_tx: UnboundedSender<statrunn
                                             // Delete log file, it's part of the error
                                             let _ =
                                                 std::fs::remove_file(path.with_extension("log"));
-                                            _ = stat_tx.send(statrunner::Message::Failure {
-                                                path: retry_path,
-                                                log: err,
-                                            });
                                             continue;
                                         }
                                     }
