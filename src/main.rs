@@ -210,12 +210,8 @@ async fn upload_evtc(
         }
     }
     let evtc = evtc_upload.build().map_err(map_err)?;
-    if !state
-        .seen
-        .lock()
-        .await
-        .insert((evtc.filesize, evtc.trigger_id, evtc.account.clone()))
-    {
+    let seen_key = (evtc.filesize, evtc.trigger_id, evtc.account.clone());
+    if !state.seen.lock().await.insert(seen_key.clone()) {
         tracing::info!(
             account = %evtc.account,
             filesize = %evtc.filesize,
@@ -238,18 +234,22 @@ async fn upload_evtc(
     let path = evtc.account.replace('.', "")
         + "_"
         + &evtc.file.file_name.unwrap_or_else(|| {
-            rand::random::<[char; 24]>()
-                .iter()
-                .filter(|c| c.is_ascii() && c.is_alphanumeric())
-                .collect::<String>()
-                + ".zevtc"
+            use rand::distributions::{Alphanumeric, DistString};
+            Alphanumeric.sample_string(&mut rand::thread_rng(), 24) + ".zevtc"
         });
     tracing::debug!("Storing file: {path}");
-    let p = stream_to_file(
+    let p = match stream_to_file(
         &path,
         stream::once(async { Ok(evtc.file.bytes) as Result<Bytes, BoxError> }),
     )
-    .await?;
+    .await
+    {
+        Ok(p) => p,
+        Err(e) => {
+            state.seen.lock().await.remove(&seen_key);
+            return Err(e);
+        }
+    };
     let _ = state
         .tx
         .send(p)

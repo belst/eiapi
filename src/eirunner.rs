@@ -4,7 +4,6 @@ use std::{
     time::Duration,
 };
 
-use anyhow::Context;
 use serde::Deserialize;
 use tokio::{sync::mpsc::UnboundedReceiver, time::timeout};
 
@@ -133,31 +132,29 @@ pub fn run(mut rx: UnboundedReceiver<PathBuf>) {
                         Ok((stdout, files)) => {
                             let retrypath = Path::new("/tmp/ei-uploads/retry/");
                             match check_output(&stdout) {
-                                // check_log_and_delete_if_exists(&path.with_extension("log")).await
-                                Ok(check) => {
-                                    match check {
-                                        Some(e) if e == WINGMAN_SUCCSESS => {
-                                            tracing::info!("Successfully uploaded");
-                                        }
-                                        None => {
-                                            tracing::info!("Not Uploaded but issue is with the log not with wingman/parser");
-                                        }
-                                        Some(err) => {
-                                            tracing::error!(
+                                Ok(check) => match check {
+                                    Some(e) if e == WINGMAN_SUCCSESS => {
+                                        tracing::info!("Successfully uploaded");
+                                    }
+                                    None => {
+                                        tracing::info!("Not Uploaded but issue is with the log not with wingman/parser");
+                                    }
+                                    Some(err) => {
+                                        tracing::error!(
                                         "Failed to upload, moving file to retry queue. Log: {err}"
                                     );
-                                            let retry_path =
-                                                retrypath.join(path.file_name().unwrap());
-                                            let _ = std::fs::rename(&path, &retry_path);
-                                            // Delete log file, it's part of the error
-                                            let _ =
-                                                std::fs::remove_file(path.with_extension("log"));
-                                            continue;
-                                        }
+                                        let retry_path = retrypath.join(path.file_name().unwrap());
+                                        let _ = std::fs::rename(&path, &retry_path);
+                                        let _ = std::fs::remove_file(path.with_extension("log"));
+                                        continue;
                                     }
-                                }
+                                },
                                 Err(e) => {
                                     tracing::error!("failed to check log file: {e}");
+                                    let retry_path = retrypath.join(path.file_name().unwrap());
+                                    let _ = std::fs::rename(&path, &retry_path);
+                                    let _ = std::fs::remove_file(path.with_extension("log"));
+                                    continue;
                                 }
                             }
                             tracing::info!("imported {files:?}");
