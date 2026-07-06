@@ -147,7 +147,6 @@ pub fn run(mut rx: UnboundedReceiver<Job>, tickets: Tickets) {
                     DEQUEUED.fetch_add(1, Ordering::SeqCst);
                     set_status(&tickets, ticket, TicketState::Processing).await;
                     tracing::info!("importing {path:?}");
-                    // TODO: get generated files from json
                     match import_file(&path).await {
                         Ok((stdout, files)) => {
                             let retrypath = Path::new("/tmp/ei-uploads/retry/");
@@ -269,20 +268,13 @@ async fn import_file(path: impl AsRef<Path>) -> anyhow::Result<(String, Vec<Stri
     }
     let generated: Vec<_> = stdout
         .lines()
-        .filter(|l| {
-            l.trim().starts_with("Parsing Successful -  ") || l.trim().starts_with("Generated: ")
+        .find_map(|l| parse_json(l.trim()).ok())
+        .map(|res| {
+            res.generated_files
+                .into_iter()
+                .map(|p| p.to_string_lossy().into_owned())
+                .collect()
         })
-        .map(|l| {
-            let s = l
-                .trim()
-                .trim_start_matches("Parsing Successful -  ")
-                .trim_start_matches("Generated: ");
-            match s.split_once(": ") {
-                Some((path, _)) => path,
-                None => s,
-            }
-            .into()
-        })
-        .collect();
+        .unwrap_or_default();
     Ok((stdout, generated))
 }
