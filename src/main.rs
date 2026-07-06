@@ -1,5 +1,5 @@
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     error::Error,
     io,
     path::PathBuf,
@@ -8,13 +8,14 @@ use std::{
         atomic::{AtomicUsize, Ordering},
         Arc,
     },
+    time::Instant,
 };
 
 use axum::{
     body::Bytes,
     extract::{
         multipart::{Field, MultipartError},
-        DefaultBodyLimit, Multipart, State,
+        DefaultBodyLimit, Multipart, Path, State,
     },
     http::StatusCode,
     routing::{get, post},
@@ -65,23 +66,85 @@ fn setup_tracing() {
     tokio::spawn(task);
 }
 
+// A queued job: the ticket handed to the client plus the stored file path.
+type Job = (usize, PathBuf);
+
+// Shared map of ticket -> latest status. Written by the worker (eirunner) and
+// read by the GET /status/:ticket handler.
+type Tickets = Arc<Mutex<HashMap<usize, TicketEntry>>>;
+
+#[derive(Debug, Clone)]
+struct TicketEntry {
+    state: TicketState,
+    // When this entry last changed, used to prune finished tickets.
+    updated: Instant,
+}
+
+impl TicketEntry {
+    fn new(state: TicketState) -> Self {
+        Self {
+            state,
+            updated: Instant::now(),
+        }
+    }
+}
+
+// Per-upload processing status surfaced to the client.
+#[derive(Debug, Clone, Serialize)]
+#[serde(tag = "state", rename_all = "snake_case")]
+pub enum TicketState {
+    // Still waiting in the queue; `position` in the response says how many are ahead.
+    Queued,
+    // Picked up by the worker: parsing + tentative wingman upload in progress.
+    Processing,
+    // Parsed and tentatively uploaded to wingman. The client can now start polling
+    // gw2wingman's /checkUploadSuccessfulWithLog for the final result.
+    Uploaded,
+    // Parsed fine, but there was nothing to upload (a log issue, not a wingman/parser
+    // fault). Nothing to poll.
+    Skipped,
+    // Parsing or upload failed; the file was moved to the retry queue server-side.
+    Failed { message: String },
+}
+
+impl TicketState {
+    // Terminal states no longer change and can be pruned after a grace period.
+    fn is_terminal(&self) -> bool {
+        matches!(
+            self,
+            TicketState::Uploaded | TicketState::Skipped | TicketState::Failed { .. }
+        )
+    }
+}
+
 #[derive(Debug)]
 struct AppState {
     seen: Mutex<HashSet<(u64, u64, String)>>,
-    tx: tokio::sync::mpsc::UnboundedSender<PathBuf>,
+    tx: tokio::sync::mpsc::UnboundedSender<Job>,
+    tickets: Tickets,
 }
 
+// Current number of files waiting in the queue (enqueued but not yet picked up).
 static QUEUE_SIZE: AtomicUsize = AtomicUsize::new(0);
+// Monotonic counter of every accepted upload. Used to hand out a ticket number
+// so the client can compute its position in the queue.
+static ENQUEUED: AtomicUsize = AtomicUsize::new(0);
+// Monotonic counter of every file the worker has picked up for processing.
+// position_in_queue = ticket - DEQUEUED (<= 0 means it is being processed).
+static DEQUEUED: AtomicUsize = AtomicUsize::new(0);
 
 #[tokio::main]
 async fn main() {
     setup_tracing();
     std::fs::create_dir_all(UPLOADS_DIRECTORY).unwrap();
-    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<Job>();
+    let tickets: Tickets = Arc::new(Mutex::new(HashMap::new()));
     tracing::info!("starting ei runner");
-    eirunner::run(rx);
+    eirunner::run(rx, tickets.clone());
     let app = Router::new()
         .route("/", get(index))
+        .route("/status", get(status))
+        .route("/status/:ticket", get(ticket_status))
         .route("/evtc", post(upload_evtc))
         .layer(DefaultBodyLimit::disable())
         .layer(RequestBodyLimitLayer::new(
@@ -91,6 +154,7 @@ async fn main() {
         .with_state(Arc::new(AppState {
             seen: Mutex::new(HashSet::new()),
             tx: tx.clone(),
+            tickets: tickets.clone(),
         }));
     let port = env("PORT", 3334);
     let listener = tokio::net::TcpListener::bind(("0.0.0.0", port))
@@ -102,6 +166,57 @@ async fn main() {
 
 async fn index() -> &'static str {
     "Hello, world!"
+}
+
+#[derive(Debug, Serialize)]
+struct StatusResponse {
+    // Files currently waiting in the queue (not yet picked up by the worker).
+    queue_size: usize,
+    // Total number of files the worker has picked up so far. A client that kept
+    // the `ticket` from its upload can compute its position as `ticket - dequeued`
+    // (a value <= 0 means the file is being processed or is already done).
+    dequeued: usize,
+}
+
+async fn status() -> Json<StatusResponse> {
+    Json(StatusResponse {
+        queue_size: QUEUE_SIZE.load(Ordering::SeqCst),
+        dequeued: DEQUEUED.load(Ordering::SeqCst),
+    })
+}
+
+#[derive(Debug, Serialize)]
+struct TicketStatusResponse {
+    ticket: usize,
+    // How many files are still ahead of this one in the queue. Only meaningful while
+    // `state` is "queued"; 0 once it is being processed or finished.
+    position: usize,
+    #[serde(flatten)]
+    state: TicketState,
+}
+
+// Lets the client poll for the position and outcome of a single upload.
+// Returns 404 once the ticket has been pruned (some time after it finished).
+async fn ticket_status(
+    State(state): State<Arc<AppState>>,
+    Path(ticket): Path<usize>,
+) -> Result<Json<TicketStatusResponse>, StatusCode> {
+    let entry = state
+        .tickets
+        .lock()
+        .await
+        .get(&ticket)
+        .cloned()
+        .ok_or(StatusCode::NOT_FOUND)?;
+    let position = match entry.state {
+        TicketState::Queued => ticket.saturating_sub(DEQUEUED.load(Ordering::SeqCst)),
+        _ => 0,
+    };
+    Ok(Json(TicketStatusResponse {
+        ticket,
+        position,
+        state: entry.state,
+    }))
 }
 
 fn map_err(err: impl Error) -> (StatusCode, String) {
@@ -146,6 +261,10 @@ struct EvtcUpload {
 #[derive(Debug, Serialize)]
 struct EvtcUploadResponse {
     result: bool,
+    // Monotonic ticket for this upload. Combine with `dequeued` from GET /status,
+    // or poll GET /status/:ticket, to follow this file's position and outcome.
+    // 0 means the file could not be enqueued.
+    ticket: usize,
 }
 
 fn env<T: FromStr>(key: &str, default: T) -> T {
@@ -250,12 +369,32 @@ async fn upload_evtc(
             return Err(e);
         }
     };
-    let _ = state
-        .tx
-        .send(p)
-        .map(|_| QUEUE_SIZE.fetch_add(1, Ordering::SeqCst))
-        .map_err(|e| tracing::error!("failed to send path: {e}"));
-    Ok(Json(EvtcUploadResponse { result: true }))
+    // Hand out a ticket and register it as queued before sending it to the worker,
+    // so a fast worker can never set "processing" before the entry exists.
+    let ticket = ENQUEUED.fetch_add(1, Ordering::SeqCst) + 1;
+    state
+        .tickets
+        .lock()
+        .await
+        .insert(ticket, TicketEntry::new(TicketState::Queued));
+    match state.tx.send((ticket, p)) {
+        Ok(()) => {
+            QUEUE_SIZE.fetch_add(1, Ordering::SeqCst);
+            Ok(Json(EvtcUploadResponse {
+                result: true,
+                ticket,
+            }))
+        }
+        Err(e) => {
+            tracing::error!("failed to send path: {e}");
+            state.tickets.lock().await.remove(&ticket);
+            state.seen.lock().await.remove(&seen_key);
+            Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "failed to enqueue".to_string(),
+            ))
+        }
+    }
 }
 
 const UPLOADS_DIRECTORY: &str = "/tmp/ei-uploads";

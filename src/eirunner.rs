@@ -1,13 +1,13 @@
 use std::{
     path::{Path, PathBuf},
     sync::atomic::Ordering,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use serde::Deserialize;
 use tokio::{sync::mpsc::UnboundedReceiver, time::timeout};
 
-use crate::QUEUE_SIZE;
+use crate::{Job, TicketState, Tickets, DEQUEUED, QUEUE_SIZE};
 
 const WINGMAN_SUCCSESS: &str = "Wingman: UploadProcessed successful: True";
 
@@ -112,20 +112,40 @@ pub fn check_output(output: &str) -> anyhow::Result<Option<String>> {
 //     Ok(ret)
 // }
 
-pub fn run(mut rx: UnboundedReceiver<PathBuf>) {
+// How long a finished ticket stays queryable via GET /status/:ticket before it is
+// pruned from memory.
+const TICKET_TTL: Duration = Duration::from_secs(60 * 30);
+
+// Update the stored status for a ticket. No-op if it has already been pruned.
+async fn set_status(tickets: &Tickets, ticket: usize, state: TicketState) {
+    if let Some(entry) = tickets.lock().await.get_mut(&ticket) {
+        entry.state = state;
+        entry.updated = Instant::now();
+    }
+}
+
+pub fn run(mut rx: UnboundedReceiver<Job>, tickets: Tickets) {
+    let prune_tickets = tickets.clone();
     let mut interval = tokio::time::interval(Duration::from_secs(120));
     tokio::spawn(async move {
         loop {
             interval.tick().await;
             tracing::info!("Queue size: {}", QUEUE_SIZE.load(Ordering::SeqCst));
+            // Drop finished tickets the client has had time to read.
+            let now = Instant::now();
+            prune_tickets.lock().await.retain(|_, e| {
+                !e.state.is_terminal() || now.duration_since(e.updated) < TICKET_TTL
+            });
         }
     });
     tokio::spawn(async move {
         loop {
             // TODO: receive span from tracing, not just path
             match rx.recv().await {
-                Some(path) => {
+                Some((ticket, path)) => {
                     QUEUE_SIZE.fetch_sub(1, Ordering::SeqCst);
+                    DEQUEUED.fetch_add(1, Ordering::SeqCst);
+                    set_status(&tickets, ticket, TicketState::Processing).await;
                     tracing::info!("importing {path:?}");
                     // TODO: get generated files from json
                     match import_file(&path).await {
@@ -135,14 +155,22 @@ pub fn run(mut rx: UnboundedReceiver<PathBuf>) {
                                 Ok(check) => match check {
                                     Some(e) if e == WINGMAN_SUCCSESS => {
                                         tracing::info!("Successfully uploaded");
+                                        set_status(&tickets, ticket, TicketState::Uploaded).await;
                                     }
                                     None => {
                                         tracing::info!("Not Uploaded but issue is with the log not with wingman/parser");
+                                        set_status(&tickets, ticket, TicketState::Skipped).await;
                                     }
                                     Some(err) => {
                                         tracing::error!(
                                         "Failed to upload, moving file to retry queue. Log: {err}"
                                     );
+                                        set_status(
+                                            &tickets,
+                                            ticket,
+                                            TicketState::Failed { message: err },
+                                        )
+                                        .await;
                                         let retry_path = retrypath.join(path.file_name().unwrap());
                                         let _ = std::fs::rename(&path, &retry_path);
                                         let _ = std::fs::remove_file(path.with_extension("log"));
@@ -151,6 +179,14 @@ pub fn run(mut rx: UnboundedReceiver<PathBuf>) {
                                 },
                                 Err(e) => {
                                     tracing::error!("failed to check log file: {e}");
+                                    set_status(
+                                        &tickets,
+                                        ticket,
+                                        TicketState::Failed {
+                                            message: e.to_string(),
+                                        },
+                                    )
+                                    .await;
                                     let retry_path = retrypath.join(path.file_name().unwrap());
                                     let _ = std::fs::rename(&path, &retry_path);
                                     let _ = std::fs::remove_file(path.with_extension("log"));
@@ -170,6 +206,14 @@ pub fn run(mut rx: UnboundedReceiver<PathBuf>) {
                         }
                         Err(err) => {
                             tracing::error!("failed to import file: {err}");
+                            set_status(
+                                &tickets,
+                                ticket,
+                                TicketState::Failed {
+                                    message: err.to_string(),
+                                },
+                            )
+                            .await;
                         }
                     }
                 }
