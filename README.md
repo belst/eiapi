@@ -1,3 +1,7 @@
+# Archived
+
+Development moved to https://git.bel.st/belst/eiapi
+
 # EVTC Upload API
 
 ## API Based on wingman uploadEVTC
